@@ -1,25 +1,100 @@
 """
 Daily Research Report Server
 Stores and displays research reports for 3 companies
+Supports PostgreSQL (Neon) and SQLite fallback
 """
+import os
 import sqlite3
 import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
+from contextlib import contextmanager
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 app = FastAPI(title="Daily Research Report Server")
 
-DB_PATH = Path(__file__).parent / "reports.db"
-TEMPLATES_DIR = Path(__file__).parent / "templates"
+# ============================
+# PostgreSQL (Neon) Functions
+# ============================
+def get_pg_connection():
+    """Get PostgreSQL connection for Neon"""
+    import psycopg
+    return psycopg.connect(DATABASE_URL)
 
-# Database setup
-def init_db():
+@contextmanager
+def get_pg_cursor():
+    """Context manager for PostgreSQL cursor"""
+    conn = get_pg_connection()
+    try:
+        cursor = conn.cursor()
+        yield cursor
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+def init_pg_db():
+    """Initialize PostgreSQL tables"""
+    with get_pg_cursor() as cur:
+        # Create companies table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS companies (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                website TEXT,
+                description TEXT
+            )
+        ''')
+        
+        # Create reports table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS reports (
+                id SERIAL PRIMARY KEY,
+                company TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                tags TEXT
+            )
+        ''')
+        
+        # Create indexes
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_reports_company ON reports(company)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date)')
+        
+        # Insert default companies
+        companies = [
+            ("Homeasy", "www.homeasy.hk", "家居服務有限公司"),
+            ("Under-Shield", "www.under-shield.com", "機電/工程/防護服務"),
+            ("Sustntech", "www.sustntech.com", "可持續發展/環保科技")
+        ]
+        for name, website, description in companies:
+            cur.execute('''
+                INSERT INTO companies (name, website, description) 
+                VALUES (%s, %s, %s)
+                ON CONFLICT (name) DO NOTHING
+            ''', (name, website, description))
+
+# ============================
+# SQLite Functions (Fallback)
+# ============================
+DB_PATH = Path(__file__).parent / "reports.db"
+
+def init_sqlite_db():
+    """Initialize SQLite tables"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''
@@ -41,7 +116,6 @@ def init_db():
             description TEXT
         )
     ''')
-    # Insert default companies
     companies = [
         ("Homeasy", "www.homeasy.hk", "家居服務有限公司"),
         ("Under-Shield", "www.under-shield.com", "機電/工程/防護服務"),
@@ -51,9 +125,19 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+# ============================
+# Initialize Database
+# ============================
+if DATABASE_URL:
+    # PostgreSQL mode (Neon)
+    init_pg_db()
+else:
+    # SQLite fallback
+    init_sqlite_db()
 
-# Pydantic models
+# ============================
+# Pydantic Models
+# ============================
 class ReportSubmit(BaseModel):
     company: str
     title: str
@@ -70,82 +154,131 @@ class ReportResponse(BaseModel):
     created_at: str
     tags: Optional[str]
 
-# API: Submit a new report
+# ============================
+# API Endpoints
+# ============================
 @app.post("/api/reports")
 async def submit_report(report: ReportSubmit):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    """Submit a new report"""
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.execute('''
-        INSERT INTO reports (company, title, content, report_date, created_at, tags)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (report.company, report.title, report.content, report.report_date, created_at, report.tags or ""))
-    conn.commit()
-    report_id = c.lastrowid
-    conn.close()
-    return {"status": "ok", "id": report_id, "created_at": created_at}
+    
+    if DATABASE_URL:
+        with get_pg_cursor() as cur:
+            cur.execute('''
+                INSERT INTO reports (company, title, content, report_date, created_at, tags)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            ''', (report.company, report.title, report.content, report.report_date, created_at, report.tags or ""))
+            report_id = cur.fetchone()[0]
+        return {"status": "ok", "id": report_id, "created_at": created_at}
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO reports (company, title, content, report_date, created_at, tags)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (report.company, report.title, report.content, report.report_date, created_at, report.tags or ""))
+        conn.commit()
+        report_id = c.lastrowid
+        conn.close()
+        return {"status": "ok", "id": report_id, "created_at": created_at}
 
-# API: Get all reports (with optional filters)
 @app.get("/api/reports")
 async def get_reports(company: Optional[str] = None, limit: int = 100):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
-    query = "SELECT * FROM reports"
-    params = []
-    if company:
-        query += " WHERE company = ?"
-        params.append(company)
-    query += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-    
-    c.execute(query, params)
-    rows = c.fetchall()
-    conn.close()
-    
-    return [dict(row) for row in rows]
+    """Get all reports with optional filter"""
+    if DATABASE_URL:
+        with get_pg_cursor() as cur:
+            if company:
+                cur.execute(
+                    "SELECT * FROM reports WHERE company = %s ORDER BY created_at DESC LIMIT %s",
+                    (company, limit)
+                )
+            else:
+                cur.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT %s", (limit,))
+            rows = cur.fetchall()
+            return [
+                {"id": r[0], "company": r[1], "title": r[2], "content": r[3], 
+                 "report_date": r[4], "created_at": r[5], "tags": r[6]}
+                for r in rows
+            ]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        if company:
+            c.execute("SELECT * FROM reports WHERE company = ? ORDER BY created_at DESC LIMIT ?", (company, limit))
+        else:
+            c.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT ?", (limit,))
+        rows = c.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
 
-# API: Get single report
 @app.get("/api/reports/{report_id}")
 async def get_report(report_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM reports WHERE id = ?", (report_id,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="Report not found")
-    return dict(row)
+    """Get single report"""
+    if DATABASE_URL:
+        with get_pg_cursor() as cur:
+            cur.execute("SELECT * FROM reports WHERE id = %s", (report_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Report not found")
+            return {"id": row[0], "company": row[1], "title": row[2], "content": row[3],
+                    "report_date": row[4], "created_at": row[5], "tags": row[6]}
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM reports WHERE id = ?", (report_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="Report not found")
+        return dict(row)
 
-# API: Get companies
 @app.get("/api/companies")
 async def get_companies():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM companies")
-    rows = c.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+    """Get all companies"""
+    if DATABASE_URL:
+        with get_pg_cursor() as cur:
+            cur.execute("SELECT * FROM companies")
+            rows = cur.fetchall()
+            return [{"id": r[0], "name": r[1], "website": r[2], "description": r[3]} for r in rows]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM companies")
+        rows = c.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
 
-# API: Delete report
 @app.delete("/api/reports/{report_id}")
 async def delete_report(report_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM reports WHERE id = ?", (report_id,))
-    conn.commit()
-    affected = c.rowcount
-    conn.close()
-    if affected == 0:
-        raise HTTPException(status_code=404, detail="Report not found")
-    return {"status": "deleted"}
+    """Delete a report"""
+    if DATABASE_URL:
+        with get_pg_cursor() as cur:
+            cur.execute("DELETE FROM reports WHERE id = %s", (report_id,))
+            affected = cur.rowcount
+        if affected == 0:
+            raise HTTPException(status_code=404, detail="Report not found")
+        return {"status": "deleted"}
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+        conn.commit()
+        affected = c.rowcount
+        conn.close()
+        if affected == 0:
+            raise HTTPException(status_code=404, detail="Report not found")
+        return {"status": "deleted"}
 
-# HTML: Main dashboard
+# ============================
+# HTML Dashboard
+# ============================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
+    """Main dashboard page"""
     reports_html = """
     <!DOCTYPE html>
 <html lang="zh-Hant">
@@ -313,10 +446,12 @@ async def dashboard():
     """
     return reports_html
 
-# Serve static files if needed
 @app.get("/status")
 async def status():
-    return {"status": "ok", "server": "report-server", "version": "1.0.0"}
+    """Health check endpoint"""
+    db_type = "PostgreSQL (Neon)" if DATABASE_URL else "SQLite"
+    return {"status": "ok", "server": "report-server", "version": "2.0.0", "database": db_type}
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8765, reload=False)
+    port = int(os.getenv("PORT", 8765))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
